@@ -2,42 +2,96 @@ import wcocr
 import os
 import uuid
 import base64
-from flask import Flask, request, jsonify
+from flask import Flask, request, Response
+import json
+from pdf2image import convert_from_bytes
+import tempfile
+import threading  # 导入线程模块
 
 app = Flask(__name__)
+app.config['JSON_AS_ASCII'] = False
 wcocr.init("/app/wx/opt/wechat/wxocr", "/app/wx/opt/wechat")
+
+# 异步删除文件函数
+def async_remove(file_path):
+    try:
+        os.remove(file_path)
+    except Exception as e:
+        app.logger.error(f"删除文件失败: {file_path}, 错误: {str(e)}")
 
 @app.route('/ocr', methods=['POST'])
 def ocr():
     try:
-        # Get base64 image from request
-        image_data = request.json.get('image')
-        if not image_data:
-            return jsonify({'error': 'No image data provided'}), 400
+        data = request.json
+        if not data or 'key' not in data or 'value' not in data:
+            return Response(
+                json.dumps({'error': '无效的请求格式，预期格式: {"key": "pdf/img", "value": "base64"}'}, ensure_ascii=False),
+                mimetype='application/json',
+                status=400
+            )
 
-        # Create temp directory if not exists
-        temp_dir = 'temp'
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+        file_type = data['key'].lower()
+        file_data = data['value']
 
-        # Generate unique filename and save image
-        filename = os.path.join(temp_dir, f"{str(uuid.uuid4())}.png")
+        if not file_data:
+            return Response(
+                json.dumps({'error': '未提供文件数据'}, ensure_ascii=False),
+                mimetype='application/json',
+                status=400
+            )
+
         try:
-            image_bytes = base64.b64decode(image_data)
-            with open(filename, 'wb') as f:
-                f.write(image_bytes)
+            file_bytes = base64.b64decode(file_data)
 
-            # Process image with OCR
-            result = wcocr.ocr(filename)
-            return jsonify({'result': result})
+            if file_type == 'pdf':
+                images = convert_from_bytes(file_bytes)
+                results = []
 
-        finally:
-            # Clean up temp file
-            if os.path.exists(filename):
-                os.remove(filename)
+                for i, image in enumerate(images):
+                    with tempfile.NamedTemporaryFile(suffix=f"_{i}.png", delete=False) as temp_image:
+                        image.save(temp_image.name, 'PNG')
+                        ocr_result = wcocr.ocr(temp_image.name)
+                        results.append(ocr_result)
+                    # 异步删除文件
+                    threading.Thread(target=async_remove, args=(temp_image.name,)).start()
+
+                return Response(
+                    json.dumps({'result': results}, ensure_ascii=False),
+                    mimetype='application/json'
+                )
+
+            elif file_type == 'img':
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_image:
+                    temp_image.write(file_bytes)
+                    temp_image.flush()
+                    ocr_result = wcocr.ocr(temp_image.name)
+                # 异步删除文件
+                threading.Thread(target=async_remove, args=(temp_image.name,)).start()
+                return Response(
+                    json.dumps({'result': [ocr_result]}, ensure_ascii=False),
+                    mimetype='application/json'
+                )
+
+            else:
+                return Response(
+                    json.dumps({'error': '不支持的文件类型，请使用pdf或img'}, ensure_ascii=False),
+                    mimetype='application/json',
+                    status=400
+                )
+
+        except Exception as e:
+            return Response(
+                json.dumps({'error': f'文件处理错误: {str(e)}'}, ensure_ascii=False),
+                mimetype='application/json',
+                status=500
+            )
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return Response(
+            json.dumps({'error': f'服务器内部错误: {str(e)}'}, ensure_ascii=False),
+            mimetype='application/json',
+            status=500
+        )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
